@@ -23,7 +23,8 @@ import platform
 import plistlib
 import socket
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import traceback
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import libarchive
 import libarchive.extract
@@ -125,8 +126,14 @@ class AirDropServer:
         return properties
 
 
-class HTTPServerV6(HTTPServer):
+class HTTPServerV6(ThreadingHTTPServer):
     address_family = socket.AF_INET6
+
+    def handle_error(self, request, client_address):
+        import traceback, logging
+        logging.getLogger(__name__).error(
+            f"Error handling request from {client_address}:\n{traceback.format_exc()}"
+        )
 
 
 class AirDropServerHandler(BaseHTTPRequestHandler):
@@ -163,7 +170,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_discover(self):
-        content_length = int(self.headers["Content-Length"])
+        content_length = int(self.headers.get("Content-Length") or self.headers.get("content-length") or 0)
         post_data = self.rfile.read(content_length)
 
         AirDropUtil.write_debug(
@@ -222,7 +229,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(discover_answer_binary)
 
     def handle_ask(self):
-        content_length = int(self.headers["Content-Length"])
+        content_length = int(self.headers.get("Content-Length") or self.headers.get("content-length") or 0)
         post_data = self.rfile.read(content_length)
 
         AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
@@ -301,7 +308,15 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         logger.info("Receiving file(s) ...")
         start = time.time()
         reader = HTTPChunkedReader(self.rfile)
-        extract_stream(reader)
+        try:
+            extract_stream(reader)
+        except Exception as e:
+            logger.error(f"extract_stream failed: {e}\n{traceback.format_exc()}")
+            self.send_response(500)
+            self.send_header("Content-Length", 0)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
 
         transferred = reader.total / 1024.0 / 1024.0
         speed = transferred / (time.time() - start)
@@ -319,7 +334,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         Handle post requests
         """
 
-        logger.debug(f"POST request at {self.path}")
+        logger.info(f"POST {self.path} from {self.client_address[0]}")
         logger.debug(f"Headers\n{self.headers}")
 
         if self.path == "/Discover":

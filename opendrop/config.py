@@ -81,7 +81,12 @@ class AirDropConfig:
         self.port = server_port
 
         if service_id is None:
-            service_id = f"{random.randint(0, 0xFFFFFFFFFFFF):012x}"  # random 6-byte string in base16
+            try:
+                import uuid
+                mac = uuid.getnode()
+                service_id = f"{mac:012x}"
+            except Exception:
+                service_id = f"{random.randint(0, 0xFFFFFFFFFFFF):012x}"
         self.service_id = service_id
 
         self.debug = debug
