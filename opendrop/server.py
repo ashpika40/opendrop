@@ -19,11 +19,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import io
 import json
 import logging
+import os
 import platform
 import plistlib
 import socket
+import struct
 import time
 import traceback
+import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import libarchive
@@ -34,6 +37,34 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 from .util import AirDropUtil
 
 logger = logging.getLogger(__name__)
+
+
+def _dvzip_decompress(data: bytes) -> bytes:
+    """Decompress Apple DVZip: repeated (4-byte BE length + zlib block) until exhausted."""
+    out = io.BytesIO()
+    offset = 0
+    while offset + 4 <= len(data):
+        (chunk_len,) = struct.unpack_from(">I", data, offset)
+        offset += 4
+        if chunk_len == 0:
+            break
+        if offset + chunk_len > len(data):
+            logger.warning(f"DVZip: truncated chunk at offset {offset}, expected {chunk_len} bytes")
+            break
+        chunk = data[offset: offset + chunk_len]
+        offset += chunk_len
+        try:
+            out.write(zlib.decompress(chunk, wbits=-15))  # raw deflate
+        except zlib.error:
+            try:
+                out.write(zlib.decompress(chunk))  # zlib wrapper
+            except zlib.error:
+                try:
+                    import gzip
+                    out.write(gzip.decompress(chunk))  # gzip wrapper
+                except Exception:
+                    out.write(chunk)  # store raw on failure
+    return out.getvalue()
 
 
 class AirDropServer:
@@ -144,12 +175,15 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     config = None
 
-    def _set_response(self, content_length):
+    def _set_response(self, content_length, keep_alive=True):
         """
         Setting the default values for a successful response
         """
         self.send_response(200)
         self.send_header("Content-Length", content_length)
+        self.send_header("Content-Type", "application/octet-stream")
+        if keep_alive:
+            self.send_header("Connection", "keep-alive")
         self.end_headers()
 
     def do_HEAD(self):
@@ -169,9 +203,24 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self._set_response(len(body))
         self.wfile.write(body)
 
+    def _read_request_body(self):
+        if self.headers.get("transfer-encoding", "").lower() == "chunked":
+            body = b""
+            while True:
+                line = self.rfile.readline().rstrip(b"\r\n")
+                chunk_size = int(line, 16)
+                if chunk_size == 0:
+                    self.rfile.readline()  # trailing CRLF
+                    break
+                body += self.rfile.read(chunk_size)
+                self.rfile.readline()  # CRLF after chunk
+            return body
+        else:
+            content_length = int(self.headers.get("Content-Length") or self.headers.get("content-length") or 0)
+            return self.rfile.read(content_length)
+
     def handle_discover(self):
-        content_length = int(self.headers.get("Content-Length") or self.headers.get("content-length") or 0)
-        post_data = self.rfile.read(content_length)
+        post_data = self._read_request_body()
 
         AirDropUtil.write_debug(
             self.config, post_data, "receive_discover_request.plist"
@@ -229,8 +278,9 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(discover_answer_binary)
 
     def handle_ask(self):
-        content_length = int(self.headers.get("Content-Length") or self.headers.get("content-length") or 0)
-        post_data = self.rfile.read(content_length)
+        conn_header = self.headers.get("Connection", "<not set>")
+        logger.info(f"/Ask Connection header from client: {conn_header!r}")
+        post_data = self._read_request_body()
 
         AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
 
@@ -246,16 +296,19 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             self.config, ask_resp_binary, "receive_ask_response.plist"
         )
 
+        # Force the connection to stay open so /Upload can arrive on the same
+        # persistent TLS connection. iOS interprets a FIN after /Ask as "declined".
+        self.close_connection = False
         self._set_response(len(ask_resp_binary))
         self.wfile.write(ask_resp_binary)
+        self.wfile.flush()
+        logger.info("/Ask response sent, keeping connection alive for /Upload")
 
     def handle_upload(self):
-        if self.headers.get("content-type", "").lower() != "application/x-cpio":
-            logger.warning(
-                f"Unsupported content-type: {self.headers.get('content-type')}"
-            )
-            self.send_response(406)  # Unprocessable Entity
-            self.send_header("Content-Type", "application/x-cpio")
+        content_type = self.headers.get("content-type", "").lower()
+        if content_type not in ("application/x-cpio", "application/x-dvzip"):
+            logger.warning(f"Unsupported content-type: {content_type}")
+            self.send_response(406)
             self.send_header("Content-Length", 0)
             self.send_header("Connection", "close")
             self.end_headers()
@@ -297,33 +350,41 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                 self.total += length
                 return length
 
-        def extract_stream(stream, flags=0):
-            """
-            Extracts an archive from memory into the current directory.
-            """
-
-            with libarchive.read.stream_reader(stream) as archive:
-                libarchive.extract.extract_entries(archive, flags)
-
         logger.info("Receiving file(s) ...")
         start = time.time()
         reader = HTTPChunkedReader(self.rfile)
+        raw = reader.read()  # read all chunks into memory
+
+        content_type = self.headers.get("content-type", "").lower()
+        dest_dir = "/home/vardhv/Downloads"
+        os.makedirs(dest_dir, exist_ok=True)
+        orig_dir = os.getcwd()
+        os.chdir(dest_dir)
         try:
-            extract_stream(reader)
+            if "dvzip" in content_type:
+                cpio_data = _dvzip_decompress(raw)
+                logger.info(f"DVZip: {len(raw)} → {len(cpio_data)} bytes CPIO")
+                with libarchive.read.memory_reader(cpio_data) as archive:
+                    libarchive.extract.extract_entries(archive)
+            else:
+                with libarchive.read.memory_reader(raw) as archive:
+                    libarchive.extract.extract_entries(archive)
         except Exception as e:
-            logger.error(f"extract_stream failed: {e}\n{traceback.format_exc()}")
+            logger.error(f"Extraction failed: {e}\n{traceback.format_exc()}")
+            os.chdir(orig_dir)
             self.send_response(500)
             self.send_header("Content-Length", 0)
             self.send_header("Connection", "close")
             self.end_headers()
             return
+        finally:
+            os.chdir(orig_dir)
 
-        transferred = reader.total / 1024.0 / 1024.0
+        transferred = len(raw) / 1024.0 / 1024.0
         speed = transferred / (time.time() - start)
-        logger.info(
-            f"File(s) received (size {transferred:.02f} MB, speed {speed:.02f} MB/s)"
-        )
+        logger.info(f"File(s) received in {dest_dir} ({transferred:.02f} MB, {speed:.02f} MB/s)")
 
+        self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Length", 0)
         self.send_header("Connection", "close")
@@ -334,7 +395,10 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         Handle post requests
         """
 
-        logger.info(f"POST {self.path} from {self.client_address[0]}")
+        logger.info(
+            f"POST {self.path} from {self.client_address[0]} "
+            f"[Connection: {self.headers.get('Connection', '<not set>')!r}]"
+        )
         logger.debug(f"Headers\n{self.headers}")
 
         if self.path == "/Discover":
