@@ -298,14 +298,14 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
 
         logger.info("Receiving file(s) ...")
         start = time.time()
-        reader = HTTPChunkedReader(self.rfile)
-        raw = reader.read()
-
         dest_dir = "/home/vardhv/Downloads"
         os.makedirs(dest_dir, exist_ok=True)
         orig_dir = os.getcwd()
         os.chdir(dest_dir)
         try:
+            reader = HTTPChunkedReader(self.rfile)
+            raw = reader.read()
+            logger.info(f"Read {len(raw)} bytes")
             if "dvzip" in content_type:
                 cpio_data = _dvzip_decompress(raw)
                 logger.info(f"DVZip decompressed: {len(raw)} → {len(cpio_data)} bytes")
@@ -315,7 +315,8 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
                 with libarchive.read.memory_reader(raw) as archive:
                     libarchive.extract.extract_entries(archive)
         except Exception as e:
-            logger.error(f"Extraction failed: {e}\n{traceback.format_exc()}")
+            logger.error(f"Upload failed: {e}\n{traceback.format_exc()}")
+            self.close_connection = True
             self.send_response(500)
             self.send_header("Content-Length", 0)
             self.send_header("Connection", "close")
