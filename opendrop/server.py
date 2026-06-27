@@ -119,8 +119,11 @@ class AirDropServer:
         self.Handler = AirDropServerHandler
         self.Handler.config = self.config
 
+        iface_addr = str(self.ip_addr)
+        if self.config.interface and "%" not in iface_addr:
+            iface_addr = f"{iface_addr}%{self.config.interface}"
         self.zeroconf = Zeroconf(
-            interfaces=[str(self.ip_addr)],
+            interfaces=[iface_addr],
             ip_version=IPVersion.V6Only,
             apple_p2p=platform.system() == "Darwin",
         )

@@ -85,6 +85,9 @@ class AirDropBrowser:
         if self.callback_remove is not None:
             self.callback_remove(info)
 
+    def update_service(self, zeroconf, service_type, name):
+        pass
+
 
 class AirDropClient:
     def __init__(self, config, receiver):
@@ -245,13 +248,10 @@ class HTTPSConnectionAWDL(HTTPSConnection):
         self,
         host,
         port=None,
-        key_file=None,
-        cert_file=None,
         timeout=None,
         source_address=None,
         *,
         context=None,
-        check_hostname=None,
         interface_name=None,
     ):
 
@@ -266,12 +266,9 @@ class HTTPSConnectionAWDL(HTTPSConnection):
         super(HTTPSConnectionAWDL, self).__init__(
             host=host,
             port=port,
-            key_file=key_file,
-            cert_file=cert_file,
             timeout=timeout,
             source_address=source_address,
             context=context,
-            check_hostname=check_hostname,
         )
 
         self.interface_name = interface_name
