@@ -48,8 +48,15 @@ class AirDropBrowser:
                     f"Interface {config.interface} does not have an IPv6 address"
                 )
 
+        # Link-local IPv6 needs the %<iface> scope suffix, else getaddrinfo
+        # returns scope_id=0 and bind() fails with EADDRNOTAVAIL (mirrors the
+        # server.py fix). Without this the ff02::fb multicast is never joined
+        # on awdl0 and discovery finds nothing.
+        iface_addr = str(self.ip_addr)
+        if config.interface and "%" not in iface_addr:
+            iface_addr = f"{iface_addr}%{config.interface}"
         self.zeroconf = Zeroconf(
-            interfaces=[str(self.ip_addr)],
+            interfaces=[iface_addr],
             ip_version=IPVersion.V6Only,
             apple_p2p=platform.system() == "Darwin",
         )

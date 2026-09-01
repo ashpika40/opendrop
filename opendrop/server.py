@@ -256,6 +256,14 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(discover_answer_binary)
 
     def handle_ask(self):
+        # macOS senders use "Expect: 100-continue" on /Ask and will not send the
+        # body until they get a 100 Continue. Without this the read below blocks
+        # forever -> the sender's transfer fails. (handle_upload does the same.)
+        if self.headers.get("expect", "").lower() == "100-continue":
+            self.send_response(100)
+            self.send_header("Content-Length", 0)
+            self.end_headers()
+
         post_data = self._read_request_body()
 
         AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
